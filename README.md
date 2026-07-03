@@ -4,6 +4,8 @@
 [![Downloads](https://img.shields.io/github/downloads/Freitag47/d4-lootfilter-generator/total)](https://github.com/Freitag47/d4-lootfilter-generator/releases)
 [![License](https://img.shields.io/github/license/Freitag47/d4-lootfilter-generator)](LICENSE)
 
+**[⬇ Download the latest release (zip)](https://github.com/Freitag47/d4-lootfilter-generator/releases/latest/download/d4-lootfilter-generator.zip)**, unpack it anywhere, double-click `run.bat`.
+
 Turn a build guide into a native Diablo 4 loot filter.
 
 The script reads a build from Mobalytics or D4Builds: the stat priorities of every
