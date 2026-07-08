@@ -21,9 +21,14 @@ set /p URL="Paste the build link (Mobalytics or D4Builds): "
 if not defined URL goto :ask
 set "URL=%URL:"=%"
 
+set "ANC="
+set /p ANC="Show unique gear only as Ancestral? [y/N]: "
+set "ANCFLAG="
+if /i "%ANC%"=="y" set "ANCFLAG=--ancestral-uniques"
+
 echo.
 echo Fetching the build, this takes a moment...
-%PY% d4_lootfilter.py "%URL%"
+%PY% d4_lootfilter.py "%URL%" %ANCFLAG%
 echo.
 set "AGAIN="
 set /p AGAIN="Another build? [y/N]: "
