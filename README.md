@@ -73,7 +73,9 @@ that matched nothing, including Ancestrals, but it is scoped to equipment item
 types: gold, materials, elixirs and sigils are never touched. With
 `--ancestral-uniques` (`run.bat` asks for it) rules 1 and 9 only match Ancestral
 uniques (via the item-properties condition, any Greater Affix count) and the
-hide rule swallows the rest, the build's uniques included. Recolors avoid
+hide rule swallows the rest, the build's uniques included. `--ancestral-gear`
+(second `run.bat` question) does the same for the white and blue slot tiers:
+only Ancestral rare/legendary drops light up, non-Ancestral matches get hidden. Recolors avoid
 orange and yellow on purpose, the game already uses those for Legendary and Rare
 item names.
 
@@ -132,6 +134,7 @@ If a fetch aborts with `Playwright is required to fetch from a URL` or
 | `--class NAME` | override the auto-detected class (drives weapon item types) |
 | `--no-hide` | never hide anything, only recolor/keep |
 | `--ancestral-uniques` | show uniques, the build's own included, only when they drop as Ancestral |
+| `--ancestral-gear` | match the per-slot BiS/gear rules only on Ancestral drops |
 | `--include-tempering` | treat tempering stats as droppable affixes (loosens matching) |
 | `--dump-json PATH` | save the raw extracted build data |
 

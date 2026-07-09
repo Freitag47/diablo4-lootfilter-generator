@@ -324,7 +324,8 @@ def detect_class(url, adb, gear_rows):
 # --------------------------------------------------------------------------
 def build_filter_code(name, unique_ids, slot_rules, fallback_ids=(), ga_n=1,
                       hide_junk=True, set_ids=(), seal_type=None, charm_type=None,
-                      all_type_ids=(), ancestral_uniques=False):
+                      all_type_ids=(), ancestral_uniques=False,
+                      ancestral_gear=False):
     """Assemble the ruleset, highest priority first:
       1. build uniques (red), the build's set charms (purple), codex upgrades (green)
       2. per-slot BiS (white): right item type, every affix slot desired, and the
@@ -337,10 +338,13 @@ def build_filter_code(name, unique_ids, slot_rules, fallback_ids=(), ga_n=1,
          item types so materials, sigils and other drops stay untouched
     With ancestral_uniques rules 1 and 5 only match Ancestral uniques/mythics
     (item-properties condition, any Greater Affix count) and 6 hides plain
-    uniques too, the build's own included.
+    uniques too, the build's own included. With ancestral_gear the slot tiers
+    in 2/3 and the fallback rule only match Ancestral drops.
     Returns (code, rule_count, dropped_bis_labels)."""
     def slot_conds(sr, n, ga):
         conds = [_c_rarity(RARE | LEGENDARY)]
+        if ancestral_gear:
+            conds.append(_c_props(PROP_ANCESTRAL))
         if sr["type_ids"]:
             conds.append(_c_itemtype(sr["type_ids"]))
         conds.append(_c_affixes(sr["ids"], n, ga))
@@ -364,9 +368,11 @@ def build_filter_code(name, unique_ids, slot_rules, fallback_ids=(), ga_n=1,
                                slot_conds(sr, sr["n_fix"], ()), C_GEAR))
         if fallback_ids:
             n = 2 if len(fallback_ids) >= NATURAL_AFFIXES else 1
-            rules.append(_rule("Build Affix", RECOLOR,
-                               [_c_rarity(RARE | LEGENDARY), _c_affixes(fallback_ids, n)],
-                               C_GEAR))
+            fconds = [_c_rarity(RARE | LEGENDARY)]
+            if ancestral_gear:
+                fconds.append(_c_props(PROP_ANCESTRAL))
+            fconds.append(_c_affixes(fallback_ids, n))
+            rules.append(_rule("Build Affix", RECOLOR, fconds, C_GEAR))
         rules.append(_rule(f"{ga_n}+ Greater Affix", RECOLOR, [_c_greater(ga_n)], C_CYAN))
         if seal_type is not None:
             rules.append(_rule("Legendary Seals", RECOLOR,
@@ -669,7 +675,7 @@ def extract_d4builds(data, include_tempering=False):
 # --------------------------------------------------------------------------
 def build(adb, udb, gear_rows, unique_slugs, name, ga_n, hide_junk, cls=None,
           tset_db=None, itype_db=None, charm_slugs=(), has_seal=False,
-          ancestral_uniques=False):
+          ancestral_uniques=False, ancestral_gear=False):
     # group desired affixes per slot family; rows without a slot
     # (--stats / --paste input) feed one global fallback pool
     groups, order, fallback_ids, unmapped = {}, [], [], []
@@ -742,7 +748,8 @@ def build(adb, udb, gear_rows, unique_slugs, name, ga_n, hide_junk, cls=None,
     code, n_rules, dropped_bis = build_filter_code(
         name, uids, slot_rules, fallback_ids, ga_n, hide_junk,
         set_ids=set_ids, seal_type=seal_type, charm_type=charm_type,
-        all_type_ids=all_type_ids, ancestral_uniques=ancestral_uniques)
+        all_type_ids=all_type_ids, ancestral_uniques=ancestral_uniques,
+        ancestral_gear=ancestral_gear)
     return code, {"slot_rules": slot_rules, "fallback": fallback_ids,
                   "unmapped": unmapped, "cls": cls,
                   "n_rules": n_rules, "dropped_bis": dropped_bis,
@@ -750,6 +757,7 @@ def build(adb, udb, gear_rows, unique_slugs, name, ga_n, hide_junk, cls=None,
                   "sets": [tset_db.name(s) for s in set_ids] if tset_db else [],
                   "build_seal": has_seal, "hide_junk": hide_junk,
                   "ancestral_uniques": ancestral_uniques,
+                  "ancestral_gear": ancestral_gear,
                   "kept": {"uniques": True, "set_charms": charm_type is not None,
                            "seals": seal_type is not None}}
 
@@ -782,12 +790,16 @@ def _report(name, variant_id, rep, code, verbose):
         print(f"  Always shown: {', '.join(keep_names)}")
     if rep.get("hide_junk"):
         hidden = "all other gear up to Legendary"
+        if rep.get("ancestral_gear"):
+            hidden += " and non-Ancestral build matches"
         if anc:
             hidden += " and non-Ancestral uniques (build uniques too)"
         print(f"  Hidden: {hidden} (magic/rare charms, "
               "low seals, unmatched legendaries incl. Ancestral)")
     if rep["slot_rules"]:
-        print("\n  Gear rules (Rare/Legendary, * = wanted as Greater Affix):")
+        rl = ("Ancestral Rare/Legendary" if rep.get("ancestral_gear")
+              else "Rare/Legendary")
+        print(f"\n  Gear rules ({rl}, * = wanted as Greater Affix):")
         for sr in rep["slot_rules"]:
             stats = ", ".join(sr["names"][h] + ("*" if h in sr["ga"] else "")
                               for h in sr["ids"])
@@ -837,6 +849,9 @@ def main():
     ap.add_argument("--ancestral-uniques", action="store_true",
                     help="show uniques/mythics, the build's own included, only "
                          "when they drop as Ancestral (any Greater Affix count)")
+    ap.add_argument("--ancestral-gear", action="store_true",
+                    help="match the per-slot BiS/gear rules only on Ancestral "
+                         "drops; non-Ancestral matches fall into the hide rule")
     ap.add_argument("--include-tempering", action="store_true",
                     help="treat tempering stats as droppable affixes")
     ap.add_argument("--print-detected", action="store_true",
@@ -861,7 +876,8 @@ def main():
         name = (args.name or (name_from_url(args.url) if args.url else "Custom Filter"))[:30]
         code, rep = build(adb, udb, rows, [], name, args.ga_threshold,
                           hide_junk, itype_db=itype_db,
-                          ancestral_uniques=args.ancestral_uniques)
+                          ancestral_uniques=args.ancestral_uniques,
+                          ancestral_gear=args.ancestral_gear)
         _report(name, None, rep, code, args.print_detected)
         return
 
@@ -905,7 +921,8 @@ def main():
                       hide_junk, cls=cls,
                       tset_db=tset_db, itype_db=itype_db,
                       charm_slugs=charm_slugs, has_seal=has_seal,
-                      ancestral_uniques=args.ancestral_uniques)
+                      ancestral_uniques=args.ancestral_uniques,
+                      ancestral_gear=args.ancestral_gear)
     _report(name, variant_id, rep, code, args.print_detected)
 
 

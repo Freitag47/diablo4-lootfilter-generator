@@ -26,9 +26,14 @@ set /p ANC="Show unique gear only as Ancestral? [y/N]: "
 set "ANCFLAG="
 if /i "%ANC%"=="y" set "ANCFLAG=--ancestral-uniques"
 
+set "ANCG="
+set /p ANCG="Show matching gear only as Ancestral? [y/N]: "
+set "ANCGFLAG="
+if /i "%ANCG%"=="y" set "ANCGFLAG=--ancestral-gear"
+
 echo.
 echo Fetching the build, this takes a moment...
-%PY% d4_lootfilter.py "%URL%" %ANCFLAG%
+%PY% d4_lootfilter.py "%URL%" %ANCFLAG% %ANCGFLAG%
 echo.
 set "AGAIN="
 set /p AGAIN="Another build? [y/N]: "
