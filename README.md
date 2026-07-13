@@ -8,16 +8,17 @@
 
 Turn a build guide into a native Diablo 4 loot filter.
 
-The script reads a build from Mobalytics or D4Builds: the stat priorities of every
-gear slot, which stats the build wants as Greater Affixes, its uniques, talisman
-set charms and seal. It maps all of that to the game's internal ids and prints an
-import code for:
+The script reads a build from Mobalytics, D4Builds or InfinityBuilds: the stat
+priorities of every gear slot, which stats the build wants as Greater Affixes, its
+uniques, talisman set charms and seal. It maps all of that to the game's internal
+ids and prints an import code for:
 
 > Character Menu → Loot Filter → New Filter → **Import**
 
 ```
 python d4_lootfilter.py "https://mobalytics.gg/diablo-4/builds/rogue-dance-of-knives"
 python d4_lootfilter.py "https://d4builds.gg/builds/dance-of-knives-rogue-endgame/?var=0"
+python d4_lootfilter.py "https://infinitybuilds.gg/en/builds/hFrM0wPM4G"
 ```
 
 On Windows you don't need a command line at all: double-click `run.bat` and
@@ -120,7 +121,7 @@ If a fetch aborts with `Playwright is required to fetch from a URL` or
 
 | Command | What it does |
 |---|---|
-| `d4_lootfilter.py "<url>"` | fetch a Mobalytics/D4Builds build, print the import code |
+| `d4_lootfilter.py "<url>"` | fetch a Mobalytics/D4Builds/InfinityBuilds build, print the import code |
 | `d4_lootfilter.py "<url>" --print-detected` | also list the detected uniques and set charms |
 | `d4_lootfilter.py --stats "vulnerable damage, max life, ..."` | build from a manual stat list |
 | `d4_lootfilter.py --paste` | paste gear text from any site, end with an empty line |
@@ -128,7 +129,7 @@ If a fetch aborts with `Playwright is required to fetch from a URL` or
 
 | Flag | Meaning |
 |---|---|
-| `--variant ID` | Mobalytics variant id (default from the URL) or d4builds `var` index |
+| `--variant ID` | Mobalytics variant id (default from the URL), d4builds `var` index, or InfinityBuilds variant index/name |
 | `--name "..."` | filter name in game, max 30 chars (default from the build) |
 | `--ga-threshold N` | Greater Affixes needed for the cyan rule (default 1) |
 | `--class NAME` | override the auto-detected class (drives weapon item types) |
@@ -140,6 +141,26 @@ If a fetch aborts with `Playwright is required to fetch from a URL` or
 
 Manual input (`--stats`/`--paste`) has no slot information, so those modes fall
 back to a single pool rule that wants 2 matching affixes.
+
+### Picking a variant
+
+Mobalytics and D4Builds put the open variant in the URL, so copying the link is
+enough. InfinityBuilds keeps it in client state: switching tabs there changes
+nothing in the address bar, and a copied link cannot say which tab you meant. So
+for those builds the script lists the variants once it has the build and asks:
+
+```
+This build has 3 variants:
+  [0] Endgame                      23 stats, 5 uniques   (default)
+  [1] Boss Rush                    23 stats, 5 uniques
+  [2] Pit/Tower Pushing            19 stats, 6 uniques
+Which variant? [0]:
+```
+
+Enter takes the default, which is the first variant that actually carries wanted
+stats (the first tab is often an empty leveling planner). `--variant 1`,
+`--variant "Boss Rush"` or a variant id skips the question, and a piped or
+scripted run is never asked and keeps the default.
 
 ## Game data
 
@@ -175,6 +196,22 @@ plus the build's unique names; id mapping, rule assembly and encoding are shared
   `greater__affix__button--filled`, rows whose dropdown carries an icon are
   tempering/aspect rows and get skipped. Equipped items via `.builder__gear__name`
   (`--unique`/`--mythic` class modifiers), charms and seal from img alt texts.
+- **InfinityBuilds** (implemented): a Next.js app router page, so the build ships
+  in the RSC flight payload (the `self.__next_f.push([1,"…"])` chunks concatenate
+  into one text that carries `variants[].gear[]` as plain JSON). Every value is a
+  game id rather than a display name, which the adapter resolves against `data/`
+  alone, no site API needed: `affixId` "affix-s04-life" against the `sno` field
+  (`S04_Life`), `itemId` "item-ring-unique-rogue-101-itm" against `internal`
+  (`Ring_Unique_Rogue_101`), charms against the talisman set `internal`. Ids also
+  encode the roll variant and item-type context (`X2_Life_Greater`,
+  `S04_CritChanceJewelry`), which stem to the same filterable affix. The `greater`
+  flag per affix is the GA mark; `tempered` rows, a unique's own stats and
+  transfiguration bonuses are not affixes a drop can roll and are skipped. Note
+  the item's `itemName` is a snapshot in whatever language the author used, so it
+  is never read. The weapon family comes from the item type inside the item id,
+  not from the slot name: builds do park a two-handed bow in the `offhand` slot.
+  The first variant is often an empty leveling planner, so the adapter defaults to
+  the first variant that actually carries wanted stats.
 - **Maxroll** (planned): the guide HTML embeds a planner id; the planner API at
   `planners.maxroll.gg/profiles/d4/<id>` returns items with numeric affix ids,
   resolvable via their `data.min.json`.

@@ -17,7 +17,7 @@ if errorlevel 1 goto :needsetup
 :ask
 echo.
 set "URL="
-set /p URL="Paste the build link (Mobalytics or D4Builds): "
+set /p URL="Paste the build link (Mobalytics, D4Builds or InfinityBuilds): "
 if not defined URL goto :ask
 set "URL=%URL:"=%"
 

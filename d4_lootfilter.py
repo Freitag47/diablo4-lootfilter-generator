@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Generate a native Diablo 4 loot filter import code from a build guide.
 
-Reads a Mobalytics or D4Builds build (per-slot stat priorities, Greater Affix
-marks, uniques, talisman set charms, seal), maps everything to the game's SNO
-ids and prints the Base64 code for:
+Reads a Mobalytics, D4Builds or InfinityBuilds build (per-slot stat priorities,
+Greater Affix marks, uniques, talisman set charms, seal), maps everything to the
+game's SNO ids and prints the Base64 code for:
     Character Menu -> Loot Filter -> New Filter -> Import
 
     python d4_lootfilter.py "https://mobalytics.gg/diablo-4/builds/rogue-dance-of-knives"
@@ -59,6 +59,44 @@ def _norm(s: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", s.lower()).strip("-")
 
 
+# Season/expansion prefix (S04_, X2_) and the suffixes the game uses for roll
+# variants and item-type-specific versions of one and the same affix.
+_SNO_PREFIX = re.compile(r"^(?:[sx]\d+-)+")
+_SNO_VARIANT = re.compile(r"(?:-(?:greater|lesser|weapon|shields|2h)|jewelry)$")
+
+
+def _sno_stem(sno: str) -> str:
+    return _SNO_PREFIX.sub("", _SNO_VARIANT.sub("", _norm(sno)))
+
+
+def _json_slice(text: str, start: int) -> str:
+    """The JSON value starting at text[start] ('{' or '['), bracket-balanced.
+    Braces and quotes inside strings don't count, and a quote is only a string
+    delimiter when it isn't itself escaped."""
+    open_c = text[start]
+    close_c = {"{": "}", "[": "]"}[open_c]
+    depth, i, instr, esc = 0, start, False, False
+    while i < len(text):
+        c = text[i]
+        if instr:
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == '"':
+                instr = False
+        elif c == '"':
+            instr = True
+        elif c == open_c:
+            depth += 1
+        elif c == close_c:
+            depth -= 1
+            if depth == 0:
+                return text[start:i + 1]
+        i += 1
+    raise RuntimeError("unterminated JSON value")
+
+
 class _DB:
     """Key to hash lookup with a fuzzy fallback, shared by affixes/item types."""
     def __init__(self, path: Path, arr_key: str):
@@ -86,7 +124,29 @@ class _DB:
 
 
 class AffixDB(_DB):
-    def __init__(self, path): super().__init__(path, "affixes")
+    def __init__(self, path):
+        super().__init__(path, "affixes")
+        # infinitybuilds names its affixes after the game's SNO
+        # ("affix-s04-life" -> S04_Life), so index those too, plus a stem that
+        # drops the season/expansion prefix and the roll/item-type variant:
+        # X2_Life_Greater, S04_CritChanceJewelry and S04_CoreStat_Intelligence_Weapon
+        # are the same filterable affix as S04_Life / S04_CritChance / ..._Intelligence.
+        self.sno2key, self.stem2key = {}, {}
+        for e in self.entries:
+            sno = _norm(e.get("sno") or "")
+            if sno and e["keys"]:
+                self.sno2key.setdefault(sno, e["keys"][0])
+                self.stem2key.setdefault(_sno_stem(sno), e["keys"][0])
+
+    def key_by_sno(self, sno):
+        """A lookup key for a game SNO, or None. Deliberately a key and not the
+        display name: names like 'DualWield Skills (Barbarian)' do not
+        round-trip back through map_slug()."""
+        s = _norm(sno)
+        for cand in (s, _SNO_VARIANT.sub("", s)):
+            if cand in self.sno2key:
+                return self.sno2key[cand]
+        return self.stem2key.get(_sno_stem(s))
 
     def classes_of(self, h):
         e = self.by_hash.get(h)
@@ -116,6 +176,15 @@ class UniqueDB:
                 if h not in self.key2hashes[k]:
                     self.key2hashes[k].append(h)
         self.all_keys = list(self.key2hashes)
+        # item ids on infinitybuilds are the game's internal names
+        # ("item-ring-unique-rogue-101-itm" -> Ring_Unique_Rogue_101). Resolving
+        # to the name (not the hash) matters: a name carries all season variant
+        # ids, one internal name only its own.
+        self.int2name = {_norm(e["internal"]): e["name"]
+                         for e in doc["uniques"] if e.get("internal")}
+
+    def name_by_internal(self, internal):
+        return self.int2name.get(_norm(internal))
 
     def name(self, h):
         e = self.by_hash.get(h)
@@ -148,6 +217,11 @@ class TalismanSetDB:
             for k in s["keys"]:
                 self.key2hash.setdefault(k, int(s["hash"], 16))
         self.keys_by_len = sorted(self.key2hash, key=len, reverse=True)
+        self.int2name = {_norm(s["internal"]): s["name"]
+                         for s in doc["talismanSets"] if s.get("internal")}
+
+    def name_by_internal(self, internal):
+        return self.int2name.get(_norm(internal))
 
     def name(self, h):
         s = self.by_hash.get(h)
@@ -418,7 +492,8 @@ def detect_site(url):
     host = (urlparse(url).hostname or "").lower()
     return ("mobalytics" if "mobalytics.gg" in host else
             "maxroll" if "maxroll.gg" in host else
-            "d4builds" if "d4builds.gg" in host else "unknown")
+            "d4builds" if "d4builds.gg" in host else
+            "infinitybuilds" if "infinitybuilds.gg" in host else "unknown")
 
 
 def _active_variant_id(url):
@@ -546,23 +621,9 @@ def _preloaded_state_from_html(html):
     if not m:
         raise RuntimeError("__PRELOADED_STATE__ not found in HTML")
     start = html.find("{", m.end())
-    depth, i, instr, esc = 0, start, False, False
-    while i < len(html):
-        c = html[i]
-        if instr:
-            esc = c == "\\" and not esc
-            if c == '"' and not esc:
-                instr = False
-        elif c == '"':
-            instr = True
-        elif c == "{":
-            depth += 1
-        elif c == "}":
-            depth -= 1
-            if depth == 0:
-                return json.loads(html[start:i + 1])
-        i += 1
-    raise RuntimeError("unterminated __PRELOADED_STATE__")
+    if start < 0:
+        raise RuntimeError("__PRELOADED_STATE__ has no object")
+    return json.loads(_json_slice(html, start))
 
 
 # --------------------------------------------------------------------------
@@ -668,6 +729,249 @@ def extract_d4builds(data, include_tempering=False):
             rows.append((slot, name, bool(st["ga"])))
     uniques = [it["name"] for it in data["items"] if it["kind"] in ("unique", "mythic")]
     return rows, uniques, list(data.get("charms") or []), bool(data.get("seal")), data.get("cls")
+
+
+# --------------------------------------------------------------------------
+# infinitybuilds (Next.js app router: the build ships in the RSC flight payload)
+# --------------------------------------------------------------------------
+# The payload is streamed as self.__next_f.push([1,"<chunk>"]) calls; the chunks
+# concatenate into one text that carries the build as plain JSON. Everything is
+# referenced by the game's own ids, so no name lookup on the site is needed:
+#   affixId "affix-s04-life"            -> affixes.json  sno      S04_Life
+#   itemId  "item-ring-unique-rogue-101-itm" -> uniques.json internal Ring_Unique_Rogue_101
+#   charm   "Talisman_Charm_Set_Rogue_05_01" -> talisman_sets.json internal Talisman_Rogue_05
+# (itemName exists too, but holds whatever language the build author used.)
+_INF_FLIGHT_JS = """() => {
+  let out = '';
+  for (const s of document.querySelectorAll('script')) {
+    const m = (s.textContent || '').match(/self\\.__next_f\\.push\\(\\[1,(.*)\\]\\)$/s);
+    if (m) { try { out += JSON.parse(m[1]); } catch (e) {} }
+  }
+  return out;
+}"""
+
+INF_ARMOR_SLOTS = {
+    "helm": "helm", "chest": "chest-armor", "gloves": "gloves", "pants": "pants",
+    "boots": "boots", "amulet": "amulet", "ring1": "ring-1", "ring2": "ring-2",
+}
+
+# The weapon family comes from the item type in the item id, not from the slot
+# name: builds do put a two-handed bow in the 'offhand' slot.
+INF_RANGED = ("2hbow", "2hcrossbow", "bow", "crossbow")
+INF_OFF_HAND = ("1hfocus", "1hshield", "1htotem", "focus", "shield", "totem")
+INF_TWO_HAND = ("2hsword", "2haxe", "2hmace", "2hscythe", "2hstaff", "2hpolearm",
+                "2hglaive", "2hquarterstaff", "quarterstaff")
+INF_ONE_HAND = ("1hsword", "1haxe", "1hmace", "1hdagger", "1hwand", "1hscythe",
+                "1hflail", "1hcrossbow", "sword", "axe", "mace", "dagger", "wand")
+
+
+def _as_list(v):
+    """A flight payload writes '$undefined' (or null) where a value is unset,
+    so a field that should hold a list may hold neither."""
+    return v if isinstance(v, list) else []
+
+
+def _inf_item_type(item_id):
+    for t in _norm(item_id).split("-"):
+        if t in INF_RANGED or t in INF_OFF_HAND or t in INF_TWO_HAND or t in INF_ONE_HAND:
+            return t
+    return None
+
+
+def _inf_slot_slug(slot, item_id, cls):
+    """infinitybuilds slot -> the slot slugs slot_type_keys() understands."""
+    if slot in INF_ARMOR_SLOTS:
+        return INF_ARMOR_SLOTS[slot]
+    t = _inf_item_type(item_id)
+    if t in INF_RANGED:
+        return "ranged-weapon"
+    if t in INF_OFF_HAND:
+        return "off-hand-weapon"
+    if t in INF_TWO_HAND:
+        if cls == "barbarian":      # the arsenal keeps one slot per 2h family
+            return ("two-handed-bludgeoning-weapon" if "mace" in t
+                    else "two-handed-slashing-weapon")
+        return "two-handed-weapon"
+    if slot == "mainhand":
+        return "dual-wield-weapon-1"
+    if slot == "offhandWeapon":
+        return "dual-wield-weapon-2"
+    if slot == "offhand":
+        return "off-hand-weapon"
+    return "main-hand-weapon"
+
+
+# Rows that are never an affix a dropped item can roll: a unique's own stats,
+# transfiguration bonuses, the weapon-damage implicit and gem powers.
+INF_NON_AFFIX = ("uberunique", "transfiguration", "weapon-damage", "gempower")
+
+
+def _inf_affix_key(affix_id, adb):
+    """Affix id -> a key for map_slug(), or None for the rows above. Anything
+    left unresolved falls through as its raw slug and is reported as unmapped
+    rather than dropped silently."""
+    core = re.sub(r"^affix-", "", _norm(affix_id))
+    if any(t in core for t in INF_NON_AFFIX):
+        return None
+    return adb.key_by_sno(core) or core
+
+
+def _inf_unique_name(item_id, udb):
+    core = re.sub(r"-itm$", "", re.sub(r"^item-", "", _norm(item_id)))
+    if "transmogitem" in core:              # a cosmetic skin, not a real unique
+        return None
+    return (udb.name_by_internal(core)
+            or udb.name_by_internal(re.sub(r"^\d+-", "", core))   # some ids carry a numeric prefix
+            or core)
+
+
+def _inf_charm_name(charm_id, udb, tset_db):
+    """Set pieces resolve to their set, unique charms to their unique; build()
+    tells the two apart again by whether a set matches."""
+    c = _norm(charm_id)
+    m = re.match(r"^talisman-charm-set-(.+)-(\d+)-\d+$", c)
+    if m:
+        return tset_db.name_by_internal(f"talisman-{m.group(1)}-{m.group(2)}") or c
+    m = re.match(r"^talisman-charm-unique-(.+)$", c)
+    if m:
+        return udb.name_by_internal(m.group(1)) or c
+    return c
+
+
+def _infinitybuilds_payload(flight, title):
+    m = re.search(r'"variants":\[\{"id":"v-', flight)
+    if not m:
+        raise RuntimeError("no build variants in the infinitybuilds payload")
+    variants = json.loads(_json_slice(flight, flight.index("[", m.start())))
+    cm = re.search(r'"classId":"([^"]+)"', flight)
+    name = re.sub(r"\s*[|｜]\s*InfinityBuilds\s*$", "", (title or "").strip())
+    return {"variants": variants, "cls": cm.group(1) if cm else None, "name": name or None}
+
+
+def fetch_infinitybuilds_playwright(url, timeout_ms=90000):
+    with _playwright()() as pw:
+        b = _launch_chromium(pw)
+        try:
+            ctx = b.new_context(viewport={"width": 1600, "height": 2400}, user_agent=_UA)
+            ctx.route("**/*", lambda r: r.abort()
+                      if r.request.resource_type in ("image", "media", "font")
+                      else r.continue_())
+            page = ctx.new_page()
+            page.goto(url, wait_until="domcontentloaded", timeout=timeout_ms)
+            for _ in range(40):
+                flight = page.evaluate(_INF_FLIGHT_JS)
+                if '"variants":[{"id":"v-' in flight:
+                    return _infinitybuilds_payload(flight, page.title())
+                page.wait_for_timeout(500)
+            raise RuntimeError("infinitybuilds build data never populated")
+        finally:
+            b.close()
+
+
+def _inf_wanted_stats(v):
+    """How many wanted stats a variant feeds into the slot rules, counted the
+    same way extract_infinitybuilds() collects them. A unique's own stats don't
+    count: that slot is matched by item name, not by affixes."""
+    n = 0
+    for g in _as_list(v.get("gear")):
+        if not isinstance(g, dict) or g.get("kind") in ("unique", "mythic"):
+            continue
+        for a in _as_list(g.get("affixes")):
+            if not isinstance(a, dict) or a.get("tempered"):
+                continue
+            core = re.sub(r"^affix-", "", _norm(a.get("affixId") or ""))
+            if core and not any(t in core for t in INF_NON_AFFIX):
+                n += 1
+    return n
+
+
+def _inf_n_uniques(v):
+    return sum(1 for g in _as_list(v.get("gear"))
+               if isinstance(g, dict) and g.get("itemId")
+               and g.get("kind") in ("unique", "mythic"))
+
+
+def _inf_variants(data):
+    return [v for v in _as_list(data.get("variants")) if isinstance(v, dict)]
+
+
+def _inf_prompt_variant(data):
+    """Which variant to use. The site keeps the open tab in client state and
+    never puts it in the URL, so a copied link cannot say which one was meant;
+    the only way to know is to ask. Ask only when someone can answer, though:
+    piped or scripted runs keep the default instead of blocking on input."""
+    variants = _inf_variants(data)
+    if len(variants) < 2 or not sys.stdin.isatty():
+        return None
+    default = variants.index(_inf_choose_variant(variants, None))
+    print(f"\nThis build has {len(variants)} variants:", file=sys.stderr)
+    for i, v in enumerate(variants):
+        name = str(v.get("name") or v.get("id") or "")[:28]
+        print(f"  [{i}] {name:<28} {_inf_wanted_stats(v):>2} stats, "
+              f"{_inf_n_uniques(v)} uniques"
+              f"{'   (default)' if i == default else ''}", file=sys.stderr)
+    print(f"Which variant? [{default}]: ", end="", file=sys.stderr, flush=True)
+    try:
+        return input().strip() or None
+    except EOFError:            # nothing on stdin after all (isatty lies under msys)
+        print(file=sys.stderr)
+        return None
+
+
+def _inf_choose_variant(variants, want):
+    """Index, id or name. By default the first variant that carries wanted
+    stats: the first tab is often a leveling variant with an empty planner,
+    which would yield a filter without a single slot rule."""
+    if want is not None:
+        w = str(want)
+        if w.isdigit() and int(w) < len(variants):
+            return variants[int(w)]
+        for v in variants:
+            if str(v.get("id")) == w or _norm(v.get("name") or "") == _norm(w):
+                return v
+        print(f"[warn] variant {want!r} not found "
+              f"({[v.get('name') for v in variants]}); using the default",
+              file=sys.stderr)
+    return (next((v for v in variants if _inf_wanted_stats(v)), None)
+            or next((v for v in variants if _inf_n_uniques(v)), None)
+            or variants[0])
+
+
+def extract_infinitybuilds(data, variant, adb, udb, tset_db, include_tempering=False):
+    """-> (variant_name, gear_rows, unique_names, charm_names, has_seal, cls).
+    A slot holding a unique/mythic contributes no pool affixes; the item itself
+    is matched by name, exactly like the other two sites."""
+    variants = _inf_variants(data)
+    if not variants:
+        raise RuntimeError("no build variants in the infinitybuilds payload")
+    var = _inf_choose_variant(variants, variant)
+    cls = data.get("cls")
+
+    rows, uniques = [], []
+    for g in _as_list(var.get("gear")):
+        if not isinstance(g, dict):
+            continue
+        item_id, kind = g.get("itemId") or "", g.get("kind") or ""
+        if kind in ("unique", "mythic"):
+            nm = _inf_unique_name(item_id, udb) if item_id else None
+            if nm:
+                uniques.append(nm)
+            continue
+        slot = _inf_slot_slug(g.get("slot") or "", item_id, cls)
+        for a in _as_list(g.get("affixes")):
+            if not isinstance(a, dict):
+                continue
+            if a.get("tempered") and not include_tempering:
+                continue
+            key = _inf_affix_key(a.get("affixId") or "", adb)
+            if key:
+                rows.append((slot, key, bool(a.get("greater"))))
+
+    tal = var.get("talisman")
+    tal = tal if isinstance(tal, dict) else {}
+    charms = [_inf_charm_name(c, udb, tset_db) for c in _as_list(tal.get("charms")) if c]
+    return (var.get("name") or var.get("id"), rows, uniques, charms,
+            bool(tal.get("seal")), cls)
 
 
 # --------------------------------------------------------------------------
@@ -837,8 +1141,10 @@ def _report(name, variant_id, rep, code, verbose):
 def main():
     ap = argparse.ArgumentParser(
         description="Generate a Diablo 4 loot filter import code from a build URL.")
-    ap.add_argument("url", nargs="?", help="Mobalytics or D4Builds build URL")
-    ap.add_argument("--variant", help="Mobalytics variant id or d4builds var index")
+    ap.add_argument("url", nargs="?",
+                    help="Mobalytics, D4Builds or InfinityBuilds build URL")
+    ap.add_argument("--variant", help="Mobalytics variant id, d4builds var index, "
+                                      "or InfinityBuilds variant index/name")
     ap.add_argument("--name", help="filter name shown in game (max 30 chars)")
     ap.add_argument("--ga-threshold", type=int, default=1,
                     help="min greater affixes for the cyan rule (default 1)")
@@ -896,6 +1202,16 @@ def main():
         variant_id = (vnames[int(var_idx)] if var_idx.isdigit() and int(var_idx) < len(vnames)
                       and vnames[int(var_idx)] else var_idx)
         page_name = _d4builds_build_name(data.get("name"))
+        cls = args.cls or page_cls or detect_class(args.url, adb, rows)
+    elif site == "infinitybuilds" and not args.html:
+        data = fetch_infinitybuilds_playwright(args.url)
+        if args.dump_json:
+            Path(args.dump_json).write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        want = args.variant if args.variant is not None else _inf_prompt_variant(data)
+        (variant_id, rows, uniques, charm_slugs, has_seal,
+         page_cls) = extract_infinitybuilds(data, want, adb, udb, tset_db,
+                                            args.include_tempering)
+        page_name = data.get("name")
         cls = args.cls or page_cls or detect_class(args.url, adb, rows)
     else:
         if args.html:
