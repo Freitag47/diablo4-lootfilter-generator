@@ -8,9 +8,9 @@
 
 Turn a build guide into a native Diablo 4 loot filter.
 
-The script reads a build from Mobalytics, D4Builds or InfinityBuilds: the stat
-priorities of every gear slot, which stats the build wants as Greater Affixes, its
-uniques, talisman set charms and seal. It maps all of that to the game's internal
+The script reads a build from Mobalytics, D4Builds, InfinityBuilds or Maxroll: the
+stat priorities of every gear slot, which stats the build wants as Greater Affixes,
+its uniques, talisman set charms and seal. It maps all of that to the game's internal
 ids and prints an import code for:
 
 > Character Menu → Loot Filter → New Filter → **Import**
@@ -19,6 +19,7 @@ ids and prints an import code for:
 python d4_lootfilter.py "https://mobalytics.gg/diablo-4/builds/rogue-dance-of-knives"
 python d4_lootfilter.py "https://d4builds.gg/builds/dance-of-knives-rogue-endgame/?var=0"
 python d4_lootfilter.py "https://infinitybuilds.gg/en/builds/hFrM0wPM4G"
+python d4_lootfilter.py "https://maxroll.gg/d4/build-guides/rain-of-arrows-rogue-guide"
 ```
 
 On Windows you don't need a command line at all: double-click `run.bat` and
@@ -113,15 +114,15 @@ python -m pip install -r requirements.txt
 python -m playwright install chromium
 ```
 
-`--stats` and `--paste` need none of this, they run on a plain Python install.
-If a fetch aborts with `Playwright is required to fetch from a URL` or
-`Chromium is missing`, the two commands above are the fix.
+Maxroll builds, `--stats` and `--paste` need none of this, they run on a plain
+Python install. If a fetch aborts with `Playwright is required to fetch from a URL`
+or `Chromium is missing`, the two commands above are the fix.
 
 ## Usage
 
 | Command | What it does |
 |---|---|
-| `d4_lootfilter.py "<url>"` | fetch a Mobalytics/D4Builds/InfinityBuilds build, print the import code |
+| `d4_lootfilter.py "<url>"` | fetch a Mobalytics/D4Builds/InfinityBuilds/Maxroll build, print the import code |
 | `d4_lootfilter.py "<url>" --print-detected` | also list the detected uniques and set charms |
 | `d4_lootfilter.py --stats "vulnerable damage, max life, ..."` | build from a manual stat list |
 | `d4_lootfilter.py --paste` | paste gear text from any site, end with an empty line |
@@ -129,7 +130,7 @@ If a fetch aborts with `Playwright is required to fetch from a URL` or
 
 | Flag | Meaning |
 |---|---|
-| `--variant ID` | Mobalytics variant id (default from the URL), d4builds `var` index, or InfinityBuilds variant index/name |
+| `--variant ID` | Mobalytics variant id (default from the URL), d4builds `var` index, or InfinityBuilds/Maxroll variant index/name |
 | `--name "..."` | filter name in game, max 30 chars (default from the build) |
 | `--ga-threshold N` | Greater Affixes needed for the cyan rule (default 1) |
 | `--class NAME` | override the auto-detected class (drives weapon item types) |
@@ -145,22 +146,27 @@ back to a single pool rule that wants 2 matching affixes.
 ### Picking a variant
 
 Mobalytics and D4Builds put the open variant in the URL, so copying the link is
-enough. InfinityBuilds keeps it in client state: switching tabs there changes
-nothing in the address bar, and a copied link cannot say which tab you meant. So
-for those builds the script lists the variants once it has the build and asks:
+enough. InfinityBuilds and Maxroll keep it in client state: switching tabs there
+changes nothing in the address bar, and a copied link cannot say which tab you
+meant. So for those builds the script lists the variants once it has the build
+and asks:
 
 ```
-This build has 3 variants:
-  [0] Endgame                      23 stats, 5 uniques   (default)
-  [1] Boss Rush                    23 stats, 5 uniques
-  [2] Pit/Tower Pushing            19 stats, 6 uniques
-Which variant? [0]:
+This build has 6 variants:
+  [0] Midgame                      49 stats, 2 uniques
+  [1] Endgame                      49 stats, 2 uniques   (default)
+  [2] Bossing                      45 stats, 3 uniques
+  [3] Tower Push                   32 stats, 7 uniques
+  [4] Poison Endgame               45 stats, 3 uniques
+  [5] Poison Tower Push            53 stats, 3 uniques
+Which variant? [1]:
 ```
 
-Enter takes the default, which is the first variant that actually carries wanted
-stats (the first tab is often an empty leveling planner). `--variant 1`,
-`--variant "Boss Rush"` or a variant id skips the question, and a piped or
-scripted run is never asked and keeps the default.
+Enter takes the default: on Maxroll the profile the planner itself opens on, on
+InfinityBuilds the first variant that actually carries wanted stats (its first
+tab is often an empty leveling planner). `--variant 3`, `--variant "Tower Push"`
+or a variant id skips the question, and a piped or scripted run is never asked
+and keeps the default.
 
 ## Game data
 
@@ -212,9 +218,22 @@ plus the build's unique names; id mapping, rule assembly and encoding are shared
   not from the slot name: builds do park a two-handed bow in the `offhand` slot.
   The first variant is often an empty leveling planner, so the adapter defaults to
   the first variant that actually carries wanted stats.
-- **Maxroll** (planned): the guide HTML embeds a planner id; the planner API at
-  `planners.maxroll.gg/profiles/d4/<id>` returns items with numeric affix ids,
-  resolvable via their `data.min.json`.
+- **Maxroll** (implemented): the only site that needs no browser. The guide HTML
+  links its planner as `maxroll.gg/d4/planner/<id>`, and
+  `planners.maxroll.gg/profiles/load/d4/<id>` hands that profile out as plain
+  JSON (a planner link works as the URL too). One profile per build variant, and
+  its `items` map a slot number to an entry in a shared item pool. Affixes are
+  numeric SNO ids (`nid`) — the very ids `affixes.json` stores as `hash` — but
+  roll and item-type variants (`X2_Life_Greater`, `S04_CritChanceJewelry`) carry
+  an id of their own, so a `nid` is resolved to its SNO name via maxroll's
+  `data.min.json` and stemmed back to the filterable affix, exactly like the
+  InfinityBuilds ids. Slot numbers differ per class (the barbarian arsenal alone
+  holds four weapons), so the slot family comes from the item type inside the
+  item id, never from the number. An item whose internal name says `_Unique_`
+  contributes no pool affixes, so a unique the data files don't know yet still
+  can't leak its fixed stats into a slot rule. Passive and kill-streak ranks
+  (`S04_PassiveRankBonus_*`, `S12_KillStreak_*`) do drop, but the game's filter
+  has no condition for them, so they are reported as unmapped instead.
 
 ## Format notes
 

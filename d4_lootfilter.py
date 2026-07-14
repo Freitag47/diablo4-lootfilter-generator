@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """Generate a native Diablo 4 loot filter import code from a build guide.
 
-Reads a Mobalytics, D4Builds or InfinityBuilds build (per-slot stat priorities,
-Greater Affix marks, uniques, talisman set charms, seal), maps everything to the
-game's SNO ids and prints the Base64 code for:
+Reads a Mobalytics, D4Builds, InfinityBuilds or Maxroll build (per-slot stat
+priorities, Greater Affix marks, uniques, talisman set charms, seal), maps
+everything to the game's SNO ids and prints the Base64 code for:
     Character Menu -> Loot Filter -> New Filter -> Import
 
     python d4_lootfilter.py "https://mobalytics.gg/diablo-4/builds/rogue-dance-of-knives"
@@ -15,10 +15,12 @@ from __future__ import annotations
 import argparse
 import base64
 import difflib
+import gzip
 import json
 import re
 import struct
 import sys
+import urllib.request
 from pathlib import Path
 from urllib.parse import parse_qs, urlencode, urlparse
 
@@ -732,15 +734,108 @@ def extract_d4builds(data, include_tempering=False):
 
 
 # --------------------------------------------------------------------------
+# sites that reference the game's own ids (infinitybuilds, maxroll)
+# --------------------------------------------------------------------------
+# Both sites name every value after the game's internal id rather than a display
+# name, so the whole build resolves against data/ alone, no site API needed:
+#   affix "affix-s04-life" / "S04_Life"      -> affixes.json       sno      S04_Life
+#   item  "item-ring-unique-rogue-101-itm"   -> uniques.json       internal Ring_Unique_Rogue_101
+#   charm "Talisman_Charm_Set_Rogue_05_01"   -> talisman_sets.json internal Talisman_Rogue_05
+# Ids also encode the roll variant and item-type context (X2_Life_Greater,
+# S04_CritChanceJewelry), which stem to the same filterable affix.
+
+# The weapon family comes from the item type inside the item id, never from the
+# slot: builds do park a two-handed bow in an 'offhand' slot, and maxroll's slot
+# numbers differ per class.
+ARMOR_TYPES = {"helm": "helm", "chest": "chest-armor", "gloves": "gloves",
+               "pants": "pants", "boots": "boots", "amulet": "amulet", "ring": "ring"}
+WEAP_RANGED = ("2hbow", "2hcrossbow", "bow", "crossbow")
+WEAP_OFF_HAND = ("1hfocus", "1hshield", "1htotem", "focus", "shield", "totem")
+WEAP_TWO_HAND = ("2hsword", "2haxe", "2hmace", "2hscythe", "2hstaff", "2hpolearm",
+                 "2hglaive", "2hquarterstaff", "quarterstaff")
+WEAP_ONE_HAND = ("1hsword", "1haxe", "1hmace", "1hdagger", "1hwand", "1hscythe",
+                 "1hflail", "1hcrossbow", "sword", "axe", "mace", "dagger", "wand")
+
+# Rows that are never an affix a dropped item can roll: a unique's own stats,
+# transfiguration bonuses, the weapon-damage implicit and gem powers. Passive
+# and kill-streak ranks are droppable but not filterable (the game's filter has
+# no condition for them), so they fall through and are reported as unmapped.
+NON_AFFIX = ("uberunique", "transfiguration", "weapon-damage", "gempower")
+
+
+def _item_type(item_id):
+    """The item type token inside an internal item id, e.g. Helm_Legendary_053
+    -> 'helm', S05_BSK_2HStaff_Unique_Druid_001 -> '2hstaff'."""
+    for t in _norm(item_id).split("-"):
+        if (t in ARMOR_TYPES or t in WEAP_RANGED or t in WEAP_OFF_HAND
+                or t in WEAP_TWO_HAND or t in WEAP_ONE_HAND):
+            return t
+    return None
+
+
+def _weapon_slot_slug(t, cls):
+    """Weapon item type -> a slot slug slot_type_keys() understands, or None for
+    a one-hander: whether that is dual wield or a main hand next to an off-hand
+    is something only the caller's slot layout knows."""
+    if t in WEAP_RANGED:
+        return "ranged-weapon"
+    if t in WEAP_OFF_HAND:
+        return "off-hand-weapon"
+    if t in WEAP_TWO_HAND:
+        if cls == "barbarian":      # the arsenal keeps one slot per 2h family
+            return ("two-handed-bludgeoning-weapon" if "mace" in t
+                    else "two-handed-slashing-weapon")
+        return "two-handed-weapon"
+    return None
+
+
+def _affix_key(affix_id, adb):
+    """Affix id or SNO -> a key for map_slug(), or None for the rows above.
+    Anything left unresolved falls through as its raw slug and is reported as
+    unmapped rather than dropped silently."""
+    core = re.sub(r"^affix-", "", _norm(affix_id))
+    if any(t in core for t in NON_AFFIX):
+        return None
+    return adb.key_by_sno(core) or core
+
+
+def _charm_name(charm_id, udb, tset_db):
+    """Set pieces resolve to their set, unique charms to their unique; build()
+    tells the two apart again by whether a set matches."""
+    c = _norm(charm_id)
+    m = re.match(r"^talisman-charm-set-(.+)-(\d+)-\d+$", c)
+    if m:
+        return tset_db.name_by_internal(f"talisman-{m.group(1)}-{m.group(2)}") or c
+    m = re.match(r"^talisman-charm-unique-(.+)$", c)
+    if m:
+        return udb.name_by_internal(m.group(1)) or c
+    return c
+
+
+def _prompt_variant(labels, default):
+    """Which variant to use. Both sites keep the open tab in client state and
+    never put it in the URL, so a copied link cannot say which one was meant;
+    the only way to know is to ask. Ask only when someone can answer, though:
+    piped or scripted runs keep the default instead of blocking on input."""
+    if len(labels) < 2 or not sys.stdin.isatty():
+        return None
+    print(f"\nThis build has {len(labels)} variants:", file=sys.stderr)
+    for i, lab in enumerate(labels):
+        print(f"  [{i}] {lab}" + ("   (default)" if i == default else ""), file=sys.stderr)
+    print(f"Which variant? [{default}]: ", end="", file=sys.stderr, flush=True)
+    try:
+        return input().strip() or None
+    except EOFError:            # nothing on stdin after all (isatty lies under msys)
+        print(file=sys.stderr)
+        return None
+
+
+# --------------------------------------------------------------------------
 # infinitybuilds (Next.js app router: the build ships in the RSC flight payload)
 # --------------------------------------------------------------------------
 # The payload is streamed as self.__next_f.push([1,"<chunk>"]) calls; the chunks
-# concatenate into one text that carries the build as plain JSON. Everything is
-# referenced by the game's own ids, so no name lookup on the site is needed:
-#   affixId "affix-s04-life"            -> affixes.json  sno      S04_Life
-#   itemId  "item-ring-unique-rogue-101-itm" -> uniques.json internal Ring_Unique_Rogue_101
-#   charm   "Talisman_Charm_Set_Rogue_05_01" -> talisman_sets.json internal Talisman_Rogue_05
-# (itemName exists too, but holds whatever language the build author used.)
+# concatenate into one text that carries the build as plain JSON. (itemName
+# exists too, but holds whatever language the build author used.)
 _INF_FLIGHT_JS = """() => {
   let out = '';
   for (const s of document.querySelectorAll('script')) {
@@ -755,15 +850,6 @@ INF_ARMOR_SLOTS = {
     "boots": "boots", "amulet": "amulet", "ring1": "ring-1", "ring2": "ring-2",
 }
 
-# The weapon family comes from the item type in the item id, not from the slot
-# name: builds do put a two-handed bow in the 'offhand' slot.
-INF_RANGED = ("2hbow", "2hcrossbow", "bow", "crossbow")
-INF_OFF_HAND = ("1hfocus", "1hshield", "1htotem", "focus", "shield", "totem")
-INF_TWO_HAND = ("2hsword", "2haxe", "2hmace", "2hscythe", "2hstaff", "2hpolearm",
-                "2hglaive", "2hquarterstaff", "quarterstaff")
-INF_ONE_HAND = ("1hsword", "1haxe", "1hmace", "1hdagger", "1hwand", "1hscythe",
-                "1hflail", "1hcrossbow", "sword", "axe", "mace", "dagger", "wand")
-
 
 def _as_list(v):
     """A flight payload writes '$undefined' (or null) where a value is unset,
@@ -771,27 +857,13 @@ def _as_list(v):
     return v if isinstance(v, list) else []
 
 
-def _inf_item_type(item_id):
-    for t in _norm(item_id).split("-"):
-        if t in INF_RANGED or t in INF_OFF_HAND or t in INF_TWO_HAND or t in INF_ONE_HAND:
-            return t
-    return None
-
-
 def _inf_slot_slug(slot, item_id, cls):
     """infinitybuilds slot -> the slot slugs slot_type_keys() understands."""
     if slot in INF_ARMOR_SLOTS:
         return INF_ARMOR_SLOTS[slot]
-    t = _inf_item_type(item_id)
-    if t in INF_RANGED:
-        return "ranged-weapon"
-    if t in INF_OFF_HAND:
-        return "off-hand-weapon"
-    if t in INF_TWO_HAND:
-        if cls == "barbarian":      # the arsenal keeps one slot per 2h family
-            return ("two-handed-bludgeoning-weapon" if "mace" in t
-                    else "two-handed-slashing-weapon")
-        return "two-handed-weapon"
+    w = _weapon_slot_slug(_item_type(item_id), cls)
+    if w:
+        return w
     if slot == "mainhand":
         return "dual-wield-weapon-1"
     if slot == "offhandWeapon":
@@ -801,21 +873,6 @@ def _inf_slot_slug(slot, item_id, cls):
     return "main-hand-weapon"
 
 
-# Rows that are never an affix a dropped item can roll: a unique's own stats,
-# transfiguration bonuses, the weapon-damage implicit and gem powers.
-INF_NON_AFFIX = ("uberunique", "transfiguration", "weapon-damage", "gempower")
-
-
-def _inf_affix_key(affix_id, adb):
-    """Affix id -> a key for map_slug(), or None for the rows above. Anything
-    left unresolved falls through as its raw slug and is reported as unmapped
-    rather than dropped silently."""
-    core = re.sub(r"^affix-", "", _norm(affix_id))
-    if any(t in core for t in INF_NON_AFFIX):
-        return None
-    return adb.key_by_sno(core) or core
-
-
 def _inf_unique_name(item_id, udb):
     core = re.sub(r"-itm$", "", re.sub(r"^item-", "", _norm(item_id)))
     if "transmogitem" in core:              # a cosmetic skin, not a real unique
@@ -823,19 +880,6 @@ def _inf_unique_name(item_id, udb):
     return (udb.name_by_internal(core)
             or udb.name_by_internal(re.sub(r"^\d+-", "", core))   # some ids carry a numeric prefix
             or core)
-
-
-def _inf_charm_name(charm_id, udb, tset_db):
-    """Set pieces resolve to their set, unique charms to their unique; build()
-    tells the two apart again by whether a set matches."""
-    c = _norm(charm_id)
-    m = re.match(r"^talisman-charm-set-(.+)-(\d+)-\d+$", c)
-    if m:
-        return tset_db.name_by_internal(f"talisman-{m.group(1)}-{m.group(2)}") or c
-    m = re.match(r"^talisman-charm-unique-(.+)$", c)
-    if m:
-        return udb.name_by_internal(m.group(1)) or c
-    return c
 
 
 def _infinitybuilds_payload(flight, title):
@@ -880,7 +924,7 @@ def _inf_wanted_stats(v):
             if not isinstance(a, dict) or a.get("tempered"):
                 continue
             core = re.sub(r"^affix-", "", _norm(a.get("affixId") or ""))
-            if core and not any(t in core for t in INF_NON_AFFIX):
+            if core and not any(t in core for t in NON_AFFIX):
                 n += 1
     return n
 
@@ -896,26 +940,13 @@ def _inf_variants(data):
 
 
 def _inf_prompt_variant(data):
-    """Which variant to use. The site keeps the open tab in client state and
-    never puts it in the URL, so a copied link cannot say which one was meant;
-    the only way to know is to ask. Ask only when someone can answer, though:
-    piped or scripted runs keep the default instead of blocking on input."""
     variants = _inf_variants(data)
-    if len(variants) < 2 or not sys.stdin.isatty():
+    if not variants:
         return None
-    default = variants.index(_inf_choose_variant(variants, None))
-    print(f"\nThis build has {len(variants)} variants:", file=sys.stderr)
-    for i, v in enumerate(variants):
-        name = str(v.get("name") or v.get("id") or "")[:28]
-        print(f"  [{i}] {name:<28} {_inf_wanted_stats(v):>2} stats, "
-              f"{_inf_n_uniques(v)} uniques"
-              f"{'   (default)' if i == default else ''}", file=sys.stderr)
-    print(f"Which variant? [{default}]: ", end="", file=sys.stderr, flush=True)
-    try:
-        return input().strip() or None
-    except EOFError:            # nothing on stdin after all (isatty lies under msys)
-        print(file=sys.stderr)
-        return None
+    labels = [f"{str(v.get('name') or v.get('id') or '')[:28]:<28} "
+              f"{_inf_wanted_stats(v):>2} stats, {_inf_n_uniques(v)} uniques"
+              for v in variants]
+    return _prompt_variant(labels, variants.index(_inf_choose_variant(variants, None)))
 
 
 def _inf_choose_variant(variants, want):
@@ -963,15 +994,156 @@ def extract_infinitybuilds(data, variant, adb, udb, tset_db, include_tempering=F
                 continue
             if a.get("tempered") and not include_tempering:
                 continue
-            key = _inf_affix_key(a.get("affixId") or "", adb)
+            key = _affix_key(a.get("affixId") or "", adb)
             if key:
                 rows.append((slot, key, bool(a.get("greater"))))
 
     tal = var.get("talisman")
     tal = tal if isinstance(tal, dict) else {}
-    charms = [_inf_charm_name(c, udb, tset_db) for c in _as_list(tal.get("charms")) if c]
+    charms = [_charm_name(c, udb, tset_db) for c in _as_list(tal.get("charms")) if c]
     return (var.get("name") or var.get("id"), rows, uniques, charms,
             bool(tal.get("seal")), cls)
+
+
+# --------------------------------------------------------------------------
+# maxroll (a build guide embeds a planner; both are plain HTTP, no browser)
+# --------------------------------------------------------------------------
+# The guide links its planner as maxroll.gg/d4/planner/<id>, whose profile the
+# planner API hands out as JSON. One profile per build variant, its "items" map
+# a per-class slot number to an entry in the shared item pool. Affixes there are
+# numeric SNO ids ("nid"); most are an affix id we already know, but roll and
+# item-type variants (X2_Life_Greater, S04_CritChanceJewelry) carry an id of
+# their own, so nids are resolved to their SNO name via maxroll's game data and
+# stemmed back to the filterable affix.
+MAXROLL_PROFILE = "https://planners.maxroll.gg/profiles/load/d4/{}"
+MAXROLL_GAME_DATA = "https://assets-ng.maxroll.gg/d4-tools/game/data.min.json"
+
+
+def _http_json(url, timeout=60):
+    req = urllib.request.Request(url, headers={"User-Agent": _UA,
+                                               "Accept-Encoding": "gzip"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        raw = r.read()
+        if r.headers.get("Content-Encoding") == "gzip":
+            raw = gzip.decompress(raw)
+    return json.loads(raw.decode("utf-8"))
+
+
+def maxroll_planner_id(url):
+    """The planner id from a guide or planner URL. A guide can link several
+    planners (one per variant tab), but they all point at the same profile."""
+    if m := re.search(r"/d4/planner/([A-Za-z0-9]+)", urlparse(url).path):
+        return m.group(1)
+    req = urllib.request.Request(url, headers={"User-Agent": _UA})
+    with urllib.request.urlopen(req, timeout=60) as r:
+        html = r.read().decode("utf-8", "replace")
+    # /d4/planner/builds is the site's own build list, not a planner
+    ids = [i for i in re.findall(r"maxroll\.gg/d4/planner/([A-Za-z0-9]+)", html)
+           if i != "builds"]
+    if not ids:
+        raise RuntimeError("no planner link on that maxroll page")
+    return ids[0]
+
+
+def fetch_maxroll(url):
+    """-> the planner profile with its build data and maxroll's nid -> SNO map."""
+    prof = _http_json(MAXROLL_PROFILE.format(maxroll_planner_id(url)))
+    game = _http_json(MAXROLL_GAME_DATA, timeout=120)
+    return {"name": prof.get("name"), "cls": (prof.get("class") or "").lower(),
+            "data": json.loads(prof["data"]),
+            "nid2sno": {e["id"]: sno for sno, e in (game.get("affixes") or {}).items()
+                        if isinstance(e, dict) and "id" in e}}
+
+
+def _mr_profiles(data):
+    return [p for p in (data.get("data", {}).get("profiles") or []) if isinstance(p, dict)]
+
+
+def _mr_items(profile, data):
+    """The profile's items, lowest slot number first (helm before weapons)."""
+    pool = data["data"].get("items") or {}
+    out = []
+    for slot, iid in sorted((profile.get("items") or {}).items(),
+                            key=lambda kv: int(kv[0]) if str(kv[0]).lstrip("-").isdigit() else 0):
+        it = pool.get(str(iid))
+        if isinstance(it, dict) and it.get("id"):
+            out.append(it)
+    return out
+
+
+def _mr_choose_profile(profiles, data, want):
+    """Index or name. By default the planner's own active profile: that is the
+    variant the guide's planner link opens on."""
+    if want is not None:
+        w = str(want)
+        if w.isdigit() and int(w) < len(profiles):
+            return int(w)
+        for i, p in enumerate(profiles):
+            if _norm(p.get("name") or "") == _norm(w):
+                return i
+        print(f"[warn] variant {want!r} not found "
+              f"({[p.get('name') for p in profiles]}); using the default",
+              file=sys.stderr)
+    active = data["data"].get("activeProfile")
+    return active if isinstance(active, int) and 0 <= active < len(profiles) else 0
+
+
+def _mr_prompt_variant(data):
+    profiles = _mr_profiles(data)
+    if not profiles:
+        return None
+    labels = []
+    for p in profiles:
+        items = _mr_items(p, data)
+        n_stats = sum(len(it.get("explicits") or []) for it in items
+                      if "unique" not in _norm(it["id"]))
+        n_uniq = sum(1 for it in items if "unique" in _norm(it["id"])
+                     and not _norm(it["id"]).startswith("talisman"))
+        labels.append(f"{str(p.get('name') or '')[:28]:<28} {n_stats:>2} stats, "
+                      f"{n_uniq} uniques")
+    return _prompt_variant(labels, _mr_choose_profile(profiles, data, None))
+
+
+def extract_maxroll(data, variant, adb, udb, tset_db, include_tempering=False):
+    """-> (variant_name, gear_rows, unique_names, charm_names, has_seal, cls).
+    A slot holding a unique/mythic contributes no pool affixes; the item itself
+    is matched by name, exactly like the other sites."""
+    profiles = _mr_profiles(data)
+    if not profiles:
+        raise RuntimeError("no build variants in the maxroll planner")
+    idx = _mr_choose_profile(profiles, data, variant)
+    prof, cls = profiles[idx], data.get("cls")
+
+    rows, uniques, charms, has_seal, n_one_hand = [], [], [], False, 0
+    for it in _mr_items(prof, data):
+        raw = it["id"]
+        core = _norm(raw)
+        if core.startswith("talisman-seal"):
+            has_seal = True
+            continue
+        if core.startswith("talisman-charm"):
+            charms.append(_charm_name(raw, udb, tset_db))
+            continue
+        # the internal name says unique/mythic outright, so a unique that is not
+        # in uniques.json yet is still kept out of the affix pools (its stats are
+        # fixed) and reported by name instead of silently widening a slot rule
+        if "unique" in core:
+            uniques.append(udb.name_by_internal(core) or core)
+            continue
+        t = _item_type(raw)
+        slot = ARMOR_TYPES.get(t) or _weapon_slot_slug(t, cls)
+        if slot is None and t in WEAP_ONE_HAND:
+            n_one_hand += 1
+            slot = f"dual-wield-weapon-{n_one_hand}"
+        rolls = list(it.get("explicits") or [])
+        if include_tempering:
+            rolls += list(it.get("tempered") or [])
+        for a in rolls:
+            sno = data["nid2sno"].get(a.get("nid"))
+            key = _affix_key(sno, adb) if sno else None
+            if key:
+                rows.append((slot or t, key, bool(a.get("greater"))))
+    return prof.get("name"), rows, uniques, charms, has_seal, cls
 
 
 # --------------------------------------------------------------------------
@@ -1142,9 +1314,9 @@ def main():
     ap = argparse.ArgumentParser(
         description="Generate a Diablo 4 loot filter import code from a build URL.")
     ap.add_argument("url", nargs="?",
-                    help="Mobalytics, D4Builds or InfinityBuilds build URL")
+                    help="Mobalytics, D4Builds, InfinityBuilds or Maxroll build URL")
     ap.add_argument("--variant", help="Mobalytics variant id, d4builds var index, "
-                                      "or InfinityBuilds variant index/name")
+                                      "or InfinityBuilds/Maxroll variant index/name")
     ap.add_argument("--name", help="filter name shown in game (max 30 chars)")
     ap.add_argument("--ga-threshold", type=int, default=1,
                     help="min greater affixes for the cyan rule (default 1)")
@@ -1211,6 +1383,16 @@ def main():
         (variant_id, rows, uniques, charm_slugs, has_seal,
          page_cls) = extract_infinitybuilds(data, want, adb, udb, tset_db,
                                             args.include_tempering)
+        page_name = data.get("name")
+        cls = args.cls or page_cls or detect_class(args.url, adb, rows)
+    elif site == "maxroll" and not args.html:
+        data = fetch_maxroll(args.url)
+        if args.dump_json:
+            Path(args.dump_json).write_text(json.dumps(data["data"], ensure_ascii=False, indent=2), encoding="utf-8")
+        want = args.variant if args.variant is not None else _mr_prompt_variant(data)
+        (variant_id, rows, uniques, charm_slugs, has_seal,
+         page_cls) = extract_maxroll(data, want, adb, udb, tset_db,
+                                     args.include_tempering)
         page_name = data.get("name")
         cls = args.cls or page_cls or detect_class(args.url, adb, rows)
     else:
